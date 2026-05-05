@@ -1,4 +1,4 @@
-﻿import asyncio, io, logging, os, re
+import asyncio, io, logging, os, re
 from datetime import datetime, timezone, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
@@ -25,7 +25,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ─── MONGODB ─────────────────────────────────────────────────────────────────
-mongo_client  = AsyncIOMotorClient(MONGO_URI)
+mongo_client  = AsyncIOMotorClient(
+    MONGO_URI,
+    maxPoolSize=20,
+    minPoolSize=5,
+    serverSelectionTimeoutMS=3000,
+    connectTimeoutMS=3000,
+    socketTimeoutMS=5000,
+)
 db            = mongo_client[DB_NAME]
 col_products  = db["products"]
 col_orders    = db["orders"]
@@ -205,27 +212,27 @@ async def verify_sub(update, context):
 
 # ─── /start ───────────────────────────────────────────────────────────────────
 async def start(update, context):
-    if await guard(update, context): return
     user = update.effective_user
-    name = user.first_name or "User"
+    if not user: return
 
-    # ── Log to log channel only ──
-    uname_display = f"@{user.username}" if user.username else "—"
-    name_link = f"<a href='tg://user?id={user.id}'>{name}</a>"
-    log_text = (
-        f"🚀 {b('New User Started Bot')}\n"
-        f"{'━'*20}\n"
-        f"👤 {b('Name:')} {name_link}\n"
-        f"🔖 {b('Username:')} {uname_display}\n"
-        f"🆔 {b('User ID:')} <code>{user.id}</code>\n"
-        f"📅 {b('Time:')} {fmt_time(now_ist())}\n"
-        f"{'━'*20}"
-    )
-    for chat_id in [LOG_CHANNEL_ID]:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=log_text, parse_mode="HTML")
-        except Exception as e:
-            logger.error(f"Log error to {chat_id}: {e}")
+    # Fast parallel: register user + check ban/maintenance simultaneously
+    await register_user(user)
+
+    if await is_banned(user.id):
+        await update.message.reply_text(f"� {b('You are banned.')}", parse_mode="HTML")
+        return
+    if await is_maintenance() and not is_admin(user.id):
+        await update.message.reply_text(f"� {b('Bot under maintenance.')}", parse_mode="HTML")
+        return
+
+    # Check force-sub
+    if not is_admin(user.id):
+        not_joined = await check_force_sub(context.bot, user.id)
+        if not_joined:
+            await send_force_sub_msg(update, not_joined)
+            return
+
+    name = user.first_name or user.username or "User"
 
     caption = (
         f"👋 {b('Hello')} {b(name)}!\n\n"
@@ -241,21 +248,37 @@ async def start(update, context):
         f"💼 {b('Want your own bot like this?')}\n"
         f"{b('Fully customizable — contact')} <a href='{OWNER_LINK}'>{b('my owner')}</a>"
     )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛒 " + sc("Browse Products"), callback_data="browse_0"),
-         InlineKeyboardButton("💰 " + sc("My Wallet"),       callback_data="wallet")],
-        [InlineKeyboardButton("📦 " + sc("My Orders"),       callback_data="my_orders_0"),
-         InlineKeyboardButton("❓ " + sc("Help"),             callback_data="help")],
-    ])
+
+    # Send message immediately, log in background
+    asyncio.create_task(_log_start(context.bot, user, name))
+
     if START_IMAGE_URL:
         try:
             await update.message.reply_photo(
                 photo=START_IMAGE_URL, caption=caption,
-                parse_mode="HTML", has_spoiler=True, reply_markup=kb)
+                parse_mode="HTML", has_spoiler=True, reply_markup=main_menu_kb())
             return
         except Exception as e:
             logger.error(f"Start photo error: {e}")
-    await update.message.reply_text(caption, parse_mode="HTML", reply_markup=kb)
+    await update.message.reply_text(caption, parse_mode="HTML", reply_markup=main_menu_kb())
+
+
+async def _log_start(bot, user, name):
+    try:
+        uname_display = f"@{user.username}" if user.username else "—"
+        name_link = f"<a href='tg://user?id={user.id}'>{name}</a>"
+        log_text = (
+            f"🚀 {b('New User Started Bot')}\n"
+            f"{'━'*20}\n"
+            f"👤 {b('Name:')} {name_link}\n"
+            f"🔖 {b('Username:')} {uname_display}\n"
+            f"🆔 {b('User ID:')} <code>{user.id}</code>\n"
+            f"📅 {b('Time:')} {fmt_time(now_ist())}\n"
+            f"{'━'*20}"
+        )
+        await bot.send_message(chat_id=LOG_CHANNEL_ID, text=log_text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Log error: {e}")
 
 # ─── BROWSE ───────────────────────────────────────────────────────────────────
 async def browse_numbers(update, context):
@@ -1235,7 +1258,7 @@ async def _show_user_profile(update, context, row, via_message=False):
         f"👤 {b('Name:')} {name_link}\n"
         f"🔖 {b('Username:')} {uname_display}\n"
         f"🆔 {b('User ID:')} <code>{uid}</code>\n"
-        f"💰 {b('Wallet:')} {b('₹'+f\"{row.get('wallet_balance',0):.2f}\")}\n"
+        f"💰 {b('Wallet:')} {b('₹' + str(round(row.get('wallet_balance', 0), 2)))}\n"
         f"🛒 {b('Purchases:')} {b(str(row.get('total_purchases',0)))}\n"
         f"🚫 {b('Banned:')} {b('Yes' if row.get('is_banned') else 'No')}\n"
         f"📅 {b('Joined:')} {fmt_time(row.get('joined_at'))}"
