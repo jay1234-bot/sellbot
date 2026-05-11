@@ -9,7 +9,7 @@ from telegram.constants import ParseMode
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 BOT_TOKEN       = "8755146987:AAHr9e55-e314QLVGcAAA9BFha1bimxVpC4"
-ADMIN_IDS       = [8746242371]
+ADMIN_IDS       = [8746242371, 8273908525]
 ADMIN_GROUP_ID  = -1003888117383
 LOG_CHANNEL_ID  = -1003934462319
 FILE_CHANNEL_ID = -1003948066152   # ← change to your file storage channel
