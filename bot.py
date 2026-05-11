@@ -1,4 +1,4 @@
-import asyncio, io, logging, os, re
+import asyncio, io, logging, os, re, json
 from datetime import datetime, timezone, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 import qrcode
@@ -8,7 +8,7 @@ from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandle
 from telegram.constants import ParseMode
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
-BOT_TOKEN       = "8583464286:AAG_HClB1D9nj11V64rKECXHxCAvs2ilPT4"
+BOT_TOKEN       = "8755146987:AAHr9e55-e314QLVGcAAA9BFha1bimxVpC4"
 ADMIN_IDS       = [8746242371]
 ADMIN_GROUP_ID  = -1003888117383
 LOG_CHANNEL_ID  = -1003934462319
@@ -23,6 +23,9 @@ START_IMAGE_URL = "https://files.catbox.moe/k3zf5t.jpg"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled error", exc_info=context.error)
 
 # ─── MONGODB ─────────────────────────────────────────────────────────────────
 mongo_client  = AsyncIOMotorClient(
@@ -40,6 +43,7 @@ col_users     = db["users"]
 col_deposits  = db["deposits"]
 col_settings  = db["settings"]
 col_channels  = db["force_channels"]
+col_categories = db["categories"]
 
 # ─── SMALL CAPS ───────────────────────────────────────────────────────────────
 _SC = str.maketrans(
@@ -68,6 +72,17 @@ async def get_setting(key, default=""):
 
 async def set_setting(key, value):
     await col_settings.update_one({"key": key}, {"$set": {"value": str(value)}}, upsert=True)
+
+async def get_runtime_links():
+    """
+    Admin-editable runtime settings (stored in Mongo settings collection).
+    Falls back to constants for safety.
+    """
+    upi = (await get_setting("upi_id", UPI_ID)).strip() or UPI_ID
+    support = (await get_setting("support_link", SUPPORT_LINK)).strip() or SUPPORT_LINK
+    owner = (await get_setting("owner_link", OWNER_LINK)).strip() or OWNER_LINK
+    start_img = (await get_setting("start_image_url", START_IMAGE_URL)).strip() or START_IMAGE_URL
+    return upi, support, owner, start_img
 
 async def register_user(user):
     await col_users.update_one(
@@ -102,13 +117,70 @@ def is_admin(user_id): return user_id in ADMIN_IDS
 def status_emoji(s):
     return {"pending": "⏳", "approved": "✅", "rejected": "❌"}.get(s, "❓")
 
+# ─── COLORED INLINE BUTTONS (Telegram Web) ───────────────────────────────────
+def ibutton_raw(
+    text: str,
+    *,
+    callback_data=None,
+    url=None,
+    style=None,  # "primary" | "success" | "danger"
+):
+    """
+    Telegram Bot API supports colored inline buttons in some clients (notably Telegram Web)
+    via InlineKeyboardButton(style=...).
+    """
+    kw = {"text": text}
+    if style in ("primary", "success", "danger"):
+        kw["style"] = style
+    if url is not None:
+        kw["url"] = url
+        return InlineKeyboardButton(**kw)
+    if callback_data is not None:
+        kw["callback_data"] = callback_data
+        return InlineKeyboardButton(**kw)
+    raise ValueError("ibutton_raw requires url or callback_data")
+
 # ─── KEYBOARDS ────────────────────────────────────────────────────────────────
 def main_menu_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("「🛒 BROWSE PRODUCTS」", callback_data="browse_0")],
-        [InlineKeyboardButton("「💰 MY WALLET」",       callback_data="wallet"),
-         InlineKeyboardButton("「📦 MY ORDERS」",       callback_data="my_orders_0")],
-        [InlineKeyboardButton("「❓ HELP & COMMANDS」",  callback_data="help")],
+        [cbutton("「🛒 ʙʀᴏᴡsᴇ ᴘʀᴏᴅᴜᴄᴛs」", callback_data="browse_0", style="primary")],
+        [cbutton("「💰 ᴍʏ ᴡᴀʟʟᴇᴛ」", callback_data="wallet", style="success"),
+         cbutton("「📦 ᴍʏ ᴏʀᴅᴇʀs」", callback_data="my_orders_0")],
+        [cbutton("「❓ ʜᴇʟᴘ & ᴄᴏᴍᴍᴀɴᴅs」", callback_data="help")],
+    ])
+
+# ─── ADMIN TOOLS (advanced) ───────────────────────────────────────────────────
+def admin_tools_kb():
+    return InlineKeyboardMarkup([
+        [ibutton_raw("📤 "+sc("Export Backup"), callback_data="admin_export", style="success"),
+         ibutton_raw("📥 "+sc("Import Backup"), callback_data="admin_import", style="primary")],
+        [ibutton_raw("🧹 "+sc("Cleanup Old Pending"), callback_data="admin_cleanup", style="danger")],
+        [ibutton_raw("🔙 "+sc("Back"), callback_data="admin_menu", style="primary")],
+    ])
+
+
+def _auto_style(seed: str) -> str:
+    """Deterministic color for any button label/callback."""
+    s = (seed or "").strip().lower()
+    h = 0
+    for c in s:
+        h = (h * 33 + ord(c)) & 0xFFFFFFFF
+    return ("primary", "success", "danger")[h % 3]
+
+
+def cbutton(text: str, *, callback_data: str | None = None, url: str | None = None, style: str | None = None):
+    """Colored button; if style omitted it auto-picks based on label+target."""
+    seed = f"{text}|{callback_data or ''}|{url or ''}"
+    st = style if style in ("primary", "success", "danger") else _auto_style(seed)
+    return ibutton_raw(text, callback_data=callback_data, url=url, style=st)
+
+
+def support_cancel_kb():
+    """Used after auto-deletion notice."""
+    # support should point to OWNER (as requested)
+    return InlineKeyboardMarkup([
+        [cbutton("💬 "+sc("Support"), url=OWNER_LINK, style="success"),
+         cbutton("❌ "+sc("Cancel"), callback_data="main_menu", style="danger")],
     ])
 
 # ─── QR CODE (UPI deep-link) ──────────────────────────────────────────────────
@@ -119,6 +191,8 @@ def generate_upi_qr(amount: float, note: str) -> io.BytesIO:
     • Generic QR scanner  → shows UPI URL; if a UPI app is installed Android/iOS
       will offer to open it automatically
     """
+    # Note: UPI ID may be changed from admin settings.
+    # We embed the current constant here; pay_upi() shows the runtime value to user.
     upi_url = (
         f"upi://pay?pa={UPI_ID}"
         f"&pn=FileStore"
@@ -156,8 +230,8 @@ async def send_force_sub_msg(update, not_joined):
     buttons = []
     for i, ch in enumerate(not_joined, 1):
         label = ch.get("channel_name") or f"Channel {i}"
-        buttons.append([InlineKeyboardButton(f"➕ {sc('Join')} {sc(label)}", url=ch["channel_link"])])
-    buttons.append([InlineKeyboardButton("✅ " + sc("I've Joined — Verify"), callback_data="verify_sub")])
+        buttons.append([ibutton_raw(f"➕ {sc('Join')} {sc(label)}", url=ch["channel_link"], style="primary")])
+    buttons.append([ibutton_raw("✅ " + sc("I've Joined — Verify"), callback_data="verify_sub", style="success")])
     text = (
         f"⚠️ {b('Access Restricted')}\n"
         f"{'━'*20}\n"
@@ -197,8 +271,8 @@ async def verify_sub(update, context):
     await query.answer()
     not_joined = await check_force_sub(context.bot, query.from_user.id)
     if not_joined:
-        buttons = [[InlineKeyboardButton(f"➕ {sc('Join')} {sc(ch.get('channel_name','Channel'))}", url=ch["channel_link"])] for ch in not_joined]
-        buttons.append([InlineKeyboardButton("✅ " + sc("Verify Again"), callback_data="verify_sub")])
+        buttons = [[ibutton_raw(f"➕ {sc('Join')} {sc(ch.get('channel_name','Channel'))}", url=ch["channel_link"], style="primary")] for ch in not_joined]
+        buttons.append([ibutton_raw("✅ " + sc("Verify Again"), callback_data="verify_sub", style="success")])
         await query.message.reply_text(
             f"❌ {b('Still not joined all channels!')}\n{bi('Please join and verify again.')}",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
@@ -215,8 +289,10 @@ async def start(update, context):
     user = update.effective_user
     if not user: return
 
-    # Fast parallel: register user + check ban/maintenance simultaneously
+    # Register + fire log IMMEDIATELY before any checks
     await register_user(user)
+    name = user.first_name or user.username or "User"
+    asyncio.create_task(_log_start(context.bot, user, name))
 
     if await is_banned(user.id):
         await update.message.reply_text(f"� {b('You are banned.')}", parse_mode="HTML")
@@ -232,12 +308,12 @@ async def start(update, context):
             await send_force_sub_msg(update, not_joined)
             return
 
-    name = user.first_name or user.username or "User"
 
+    upi_id, support_link, owner_link, start_image_url = await get_runtime_links()
     caption = (
         f"👋 {b('Hello')} {b(name)}!\n\n"
         f"🤖 {b('I am Super Fast File Store Bot')}\n"
-        f"{bi('Made by')} <a href='{OWNER_LINK}'>{b('Krishan')}</a>\n\n"
+        f"{bi('Made by')} <a href='{owner_link}'>{b('Krishan')}</a>\n\n"
         f"{'━'*20}\n"
         f"⚡ {b('What I Offer:')}\n"
         f"• {b('Super Fast Payment Verification')}\n"
@@ -246,16 +322,13 @@ async def start(update, context):
         f"• {b('Secure & Private')}\n"
         f"{'━'*20}\n\n"
         f"💼 {b('Want your own bot like this?')}\n"
-        f"{b('Fully customizable — contact')} <a href='{OWNER_LINK}'>{b('my owner')}</a>"
+        f"{b('Fully customizable — contact')} <a href='{owner_link}'>{b('my owner')}</a>"
     )
 
-    # Send message immediately, log in background
-    asyncio.create_task(_log_start(context.bot, user, name))
-
-    if START_IMAGE_URL:
+    if start_image_url:
         try:
             await update.message.reply_photo(
-                photo=START_IMAGE_URL, caption=caption,
+                photo=start_image_url, caption=caption,
                 parse_mode="HTML", has_spoiler=True, reply_markup=main_menu_kb())
             return
         except Exception as e:
@@ -286,12 +359,42 @@ async def browse_numbers(update, context):
     await query.answer()
     if await guard(update, context): return
     page = int(query.data.split("_")[1])
+    # Category-first browsing
+    cats = [c async for c in col_categories.find({"enabled": {"$ne": False}}).sort("name", 1)]
+    if cats:
+        per_page = 8
+        total = len(cats)
+        pages = max(1, (total + per_page - 1) // per_page)
+        page = max(0, min(page, pages - 1))
+        chunk = cats[page * per_page:(page + 1) * per_page]
+        buttons = []
+        for c in chunk:
+            cid = str(c["_id"])
+            buttons.append([cbutton(f"📂 {sc(c.get('name','Category'))}", callback_data=f"cat_{cid}")])
+        nav = []
+        if page > 0:
+            nav.append(cbutton("◀️ " + sc("Prev"), callback_data=f"browse_{page-1}", style="primary"))
+        nav.append(cbutton(f"{page+1}/{pages}", callback_data="noop", style="primary"))
+        if page < pages - 1:
+            nav.append(cbutton(sc("Next") + " ▶️", callback_data=f"browse_{page+1}", style="primary"))
+        if nav:
+            buttons.append(nav)
+        buttons.append([cbutton("🔙 " + sc("Main Menu"), callback_data="main_menu", style="primary")])
+        await query.message.reply_text(
+            f"📂 {b('Categories')}\n{'━'*20}\n{bi('Select a category:')}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        await query.message.delete()
+        return
+
+    # Fallback: old product list if no categories exist
     products = [p async for p in col_products.find({"enabled": True})]
     if not products:
         await query.message.reply_text(
             f"📦 {b('No products available right now.')}\n{bi('Check back soon!')}",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🔙 MENU」", callback_data="main_menu")]]))
+            reply_markup=InlineKeyboardMarkup([[cbutton("「🔙 ᴍᴇɴᴜ」", callback_data="main_menu")]]))
         await query.message.delete()
         return
     per_page = 5; total = len(products)
@@ -301,14 +404,13 @@ async def browse_numbers(update, context):
     buttons = []
     for p in chunk:
         pid = str(p["_id"])
-        buttons.append([InlineKeyboardButton(
-            f"📦 {sc(p['name'])}  •  ₹{p['price_inr']:.0f}", callback_data=f"product_{pid}")])
+        buttons.append([cbutton(f"📦 {sc(p['name'])}  •  ₹{p['price_inr']:.0f}", callback_data=f"product_{pid}")])
     nav = []
-    if page > 0: nav.append(InlineKeyboardButton("◀️ " + sc("Prev"), callback_data=f"browse_{page-1}"))
-    nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="noop"))
-    if page < pages-1: nav.append(InlineKeyboardButton(sc("Next") + " ▶️", callback_data=f"browse_{page+1}"))
+    if page > 0: nav.append(cbutton("◀️ " + sc("Prev"), callback_data=f"browse_{page-1}", style="primary"))
+    nav.append(cbutton(f"{page+1}/{pages}", callback_data="noop", style="primary"))
+    if page < pages-1: nav.append(cbutton(sc("Next") + " ▶️", callback_data=f"browse_{page+1}", style="primary"))
     if nav: buttons.append(nav)
-    buttons.append([InlineKeyboardButton("🔙 " + sc("Main Menu"), callback_data="main_menu")])
+    buttons.append([cbutton("🔙 " + sc("Main Menu"), callback_data="main_menu", style="primary")])
     await query.message.reply_text(
         f"🛒 {b('Available Products')}\n{'━'*20}\n{bi('Select a product to purchase:')}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
@@ -316,6 +418,46 @@ async def browse_numbers(update, context):
 
 async def noop_callback(update, context):
     await update.callback_query.answer()
+
+# ─── CATEGORY VIEW ────────────────────────────────────────────────────────────
+async def category_view(update, context):
+    query = update.callback_query
+    await query.answer()
+    if await guard(update, context):
+        return
+    from bson import ObjectId
+    cid = query.data.split("_", 1)[1]
+    try:
+        cat = await col_categories.find_one({"_id": ObjectId(cid)})
+    except Exception:
+        cat = None
+    if not cat or cat.get("enabled") is False:
+        await query.message.reply_text(f"❌ {b('Category not found.')}", parse_mode="HTML")
+        await query.message.delete()
+        return
+
+    # List products in this category
+    products = [p async for p in col_products.find({"enabled": True, "category_id": cid}).sort("name", 1)]
+    if not products:
+        await query.message.reply_text(
+            f"📂 {b(cat.get('name','Category'))}\n{'━'*20}\n{bi('No products in this category yet.')}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[cbutton("🔙 "+sc("Back"), callback_data="browse_0", style="primary")]]),
+        )
+        await query.message.delete()
+        return
+
+    buttons = []
+    for p in products[:30]:
+        pid = str(p["_id"])
+        buttons.append([cbutton(f"📦 {sc(p['name'])}  •  ₹{p['price_inr']:.0f}", callback_data=f"product_{pid}")])
+    buttons.append([cbutton("🔙 "+sc("Back"), callback_data="browse_0", style="primary")])
+    await query.message.reply_text(
+        f"📂 {b(cat.get('name','Category'))}\n{'━'*20}\n{bi('Select a product:')}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    await query.message.delete()
 
 # ─── PRODUCT DETAIL ───────────────────────────────────────────────────────────
 async def product_detail(update, context):
@@ -340,9 +482,9 @@ async def product_detail(update, context):
         f"{bi('Choose your payment method below:')}"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("「💳 BUY WITH UPI」",           callback_data=f"pay_upi_{pid}")],
-        [InlineKeyboardButton(f"「💰 BUY FROM WALLET (₹{wallet:.2f})」", callback_data=f"wallet_buy_{pid}")],
-        [InlineKeyboardButton("「🔙 BACK」",                   callback_data="browse_0")],
+        [cbutton("「💳 ʙᴜʏ ᴡɪᴛʜ ᴜᴘɪ」", callback_data=f"pay_upi_{pid}", style="danger")],
+        [cbutton(f"「💰 ʙᴜʏ ꜰʀᴏᴍ ᴡᴀʟʟᴇᴛ (₹{wallet:.2f})」", callback_data=f"wallet_buy_{pid}", style="success")],
+        [cbutton("「🔙 ʙᴀᴄᴋ」", callback_data="browse_0", style="primary")],
     ])
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
     await query.message.delete()
@@ -372,8 +514,8 @@ async def wallet_buy(update, context):
             f"{bi('Please deposit funds to continue.')}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("「➕ DEPOSIT FUNDS」", callback_data="wallet")],
-                [InlineKeyboardButton("「🔙 BACK」",          callback_data=f"product_{pid}")],
+                [InlineKeyboardButton("「➕ ᴅᴇᴘᴏsɪᴛ ꜰᴜɴᴅs」", callback_data="wallet")],
+                [InlineKeyboardButton("「🔙 ʙᴀᴄᴋ」",          callback_data=f"product_{pid}")],
             ]))
         await query.message.delete()
         return
@@ -408,13 +550,14 @@ async def pay_upi(update, context):
         await query.message.delete()
         return
     context.user_data["buy_product_id"] = pid
+    upi_id, support_link, owner_link, start_image_url = await get_runtime_links()
     qr_buf = generate_upi_qr(p["price_inr"], sc(f"Order {p['name']}"))
     caption = (
         f"{'━'*20}\n"
         f"💳 {b('UPI Payment')}\n"
         f"{'━'*20}\n"
         f"💰 {b('Amount:')} {b('₹' + str(int(p['price_inr'])))}\n"
-        f"🏦 {b('UPI ID:')} <code>{UPI_ID}</code>\n\n"
+        f"🏦 {b('UPI ID:')} <code>{upi_id}</code>\n\n"
         f"📱 {b('Scan with any UPI app:')}\n"
         f"• {sc('PhonePe')}  • {sc('Google Pay')}  • {sc('Paytm')}\n"
         f"• {sc('BHIM')}  • {sc('Any UPI App')}\n\n"
@@ -423,7 +566,7 @@ async def pay_upi(update, context):
         f"{bi('After payment, tap the button below to upload screenshot.')}"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("「📸 I'VE PAID — UPLOAD SCREENSHOT」", callback_data=f"buy_upload_{pid}")],
+        [InlineKeyboardButton("「📸 ɪ'ᴠᴇ ᴘᴀɪᴅ — ᴜᴘʟᴏᴀᴅ sᴄʀᴇᴇɴsʜᴏᴛ」", callback_data=f"buy_upload_{pid}")],
         [InlineKeyboardButton("🔙 " + sc("Back"),                           callback_data=f"product_{pid}")],
     ])
     await query.message.reply_photo(photo=qr_buf, caption=caption, parse_mode="HTML", reply_markup=kb)
@@ -441,7 +584,7 @@ async def buy_upload_prompt(update, context):
         f"{b('Please send your payment screenshot as a photo.')}\n"
         f"{bi('Make sure the amount and UPI ID are clearly visible.')}",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「❌ CANCEL」", callback_data=f"product_{pid}")]]))
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「❌ ᴄᴀɴᴄᴇʟ」", callback_data=f"product_{pid}")]]))
     await query.message.delete()
 
 # ─── DELIVER FILE (no forward, protect content) ───────────────────────────────
@@ -455,6 +598,7 @@ async def deliver_file(bot, user_id, product, order_id):
     if not raw_ids and product.get("file_msg_id"):
         raw_ids = [product["file_msg_id"]]
 
+    upi_id, support_link, owner_link, start_image_url = await get_runtime_links()
     caption = (
         f"🎉 {b('Enjoy! Here Is Your File')}\n"
         f"{'━'*20}\n"
@@ -465,19 +609,20 @@ async def deliver_file(bot, user_id, product, order_id):
         f"{b('This file will be deleted in 1 hour.')}\n"
         f"{b('Download it now!')}\n\n"
         f"{bi('If deleted before download, contact')} "
-        f"<a href='{SUPPORT_LINK}'>{b('Support')}</a>"
+        f"<a href='{support_link}'>{b('Support')}</a>"
     )
 
     if not raw_ids:
-        await bot.send_message(chat_id=user_id, text=caption, parse_mode="HTML",
-                               reply_markup=main_menu_kb())
+        # No buttons on delivery-related messages
+        await bot.send_message(chat_id=user_id, text=caption, parse_mode="HTML")
         return
 
     delivered = 0
+    delivered_msg_ids: List[int] = []
     for i, fid in enumerate(raw_ids):
         try:
             # First file gets caption, rest get none — no "Forwarded from" + protect_content
-            await bot.copy_message(
+            msg = await bot.copy_message(
                 chat_id=user_id,
                 from_chat_id=file_channel,
                 message_id=int(fid),
@@ -485,6 +630,8 @@ async def deliver_file(bot, user_id, product, order_id):
                 parse_mode="HTML" if i == 0 else None,
                 protect_content=True,
             )
+            if msg:
+                delivered_msg_ids.append(msg.message_id)
             delivered += 1
             if len(raw_ids) > 1:
                 await asyncio.sleep(0.4)
@@ -492,18 +639,123 @@ async def deliver_file(bot, user_id, product, order_id):
             logger.error(f"File delivery error fid={fid}: {e}")
 
     if delivered > 0:
+        # No buttons on delivery-related messages
         await bot.send_message(
             chat_id=user_id,
             text=(f"✅ {b(str(delivered)+' File(s) Delivered Successfully!')}\n"
                   f"{bi('Download before they expire!')} ⏳"),
-            parse_mode="HTML", reply_markup=main_menu_kb())
+            parse_mode="HTML",
+        )
+        # Auto-delete after 1 hour, then notify user
+        asyncio.create_task(_delete_delivered_after(bot, user_id, delivered_msg_ids))
+        # Log delivery to admin group (with file copy)
+        asyncio.create_task(_log_delivery_to_admin(bot, user_id, product, order_id, raw_ids, file_channel))
     else:
         await bot.send_message(
             chat_id=user_id,
             text=(f"✅ {b('Order Approved!')}\n\n"
                   f"⚠️ {b('File delivery failed.')}\n"
-                  f"{b('Contact')} <a href='{SUPPORT_LINK}'>{b('Support')}</a>"),
-            parse_mode="HTML", reply_markup=main_menu_kb())
+                  f"{b('Contact')} <a href='{support_link}'>{b('Support')}</a>"),
+            parse_mode="HTML")
+
+
+async def _log_delivery_to_admin(bot, user_id: int, product: dict, order_id: str, file_msg_ids: List[int], file_channel: int):
+    """Send delivery proof to ADMIN_GROUP_ID: info + copied file(s)."""
+    try:
+        user = await bot.get_chat(user_id)
+        uname = f"@{user.username}" if getattr(user, "username", None) else "—"
+        name = " ".join([x for x in [getattr(user, "first_name", ""), getattr(user, "last_name", "")] if x]).strip() or "User"
+    except Exception:
+        uname = "—"
+        name = "User"
+
+    # Try to fetch order amount + payment method if available
+    amount = None
+    paym = None
+    try:
+        from bson import ObjectId
+        o = await col_orders.find_one({"_id": ObjectId(order_id)})
+        if o:
+            amount = o.get("amount_inr")
+            paym = o.get("payment_method")
+    except Exception:
+        pass
+
+    product_name = product.get("name") or product.get("product_name") or "Product"
+    amount_txt = f"₹{int(amount)}" if isinstance(amount, (int, float)) else "—"
+    paym_txt = (str(paym).upper() if paym else "—")
+    info = (
+        f"📦 {b('DELIVERED')}\n"
+        f"{'━'*20}\n"
+        f"👤 {b('User:')} {b(name)}\n"
+        f"🔖 {b('Username:')} {sc(uname)}\n"
+        f"🆔 {b('User ID:')} <code>{user_id}</code>\n"
+        f"{'━'*20}\n"
+        f"🛒 {b('Item:')} {b(product_name)}\n"
+        f"💰 {b('Price:')} {b(amount_txt)} | {b(paym_txt)}\n"
+        f"🧾 {b('Order:')} <code>{order_id[:8]}</code>\n"
+        f"📁 {b('Files:')} {b(str(len(file_msg_ids)))}\n"
+        f"📅 {b('Time:')} {fmt_time(now_ist())}\n"
+        f"{'━'*20}"
+    )
+
+    # Send info first
+    try:
+        await bot.send_message(chat_id=ADMIN_GROUP_ID, text=info, parse_mode="HTML")
+    except Exception:
+        pass
+
+    # Copy delivered file(s) to admin group as proof
+    for i, fid in enumerate(file_msg_ids[:10]):  # cap spam
+        try:
+            await bot.copy_message(
+                chat_id=ADMIN_GROUP_ID,
+                from_chat_id=file_channel,
+                message_id=int(fid),
+                caption=(f"{b('Delivered file proof')} • <code>{order_id[:8]}</code>" if i == 0 else None),
+                parse_mode="HTML" if i == 0 else None,
+                protect_content=True,
+            )
+            await asyncio.sleep(0.25)
+        except Exception:
+            pass
+
+
+async def _delete_delivered_after(bot, user_id: int, msg_ids: List[int], seconds: int = 3600):
+    """Delete delivered file messages after `seconds` and notify user."""
+    if not msg_ids:
+        return
+    try:
+        await asyncio.sleep(seconds)
+    except Exception:
+        return
+
+    deleted = 0
+    for mid in msg_ids:
+        try:
+            await bot.delete_message(chat_id=user_id, message_id=mid)
+            deleted += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+    # After 1 hour, send the required message + Support/Cancel
+    upi_id, support_link, owner_link, start_image_url = await get_runtime_links()
+    if deleted > 0:
+        text = (
+            f"🗑️ {b('Your file has been deleted successfully.')}\n"
+            f"{'━'*20}\n"
+            f"{bi('If you have not downloaded it yet, please contact support here.')}"
+        )
+        await bot.send_message(
+            chat_id=user_id,
+            text=text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [cbutton("💬 "+sc("Support"), url=owner_link, style="success"),
+                 cbutton("❌ "+sc("Cancel"), callback_data="main_menu", style="danger")],
+            ]),
+        )
 
 # ─── SCREENSHOT HANDLER ───────────────────────────────────────────────────────
 async def screenshot_handler(update, context):
@@ -546,8 +798,8 @@ async def screenshot_handler(update, context):
             f"{'━'*20}"
         )
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("「✅ APPROVE」", callback_data=f"approve_order_{order_id}"),
-            InlineKeyboardButton("「❌ REJECT」",  callback_data=f"reject_order_{order_id}"),
+            InlineKeyboardButton("「✅ ᴀᴘᴘʀᴏᴠᴇ」", callback_data=f"approve_order_{order_id}"),
+            InlineKeyboardButton("「❌ ʀᴇᴊᴇᴄᴛ」",  callback_data=f"reject_order_{order_id}"),
         ]])
         try:
             await context.bot.send_photo(chat_id=ADMIN_GROUP_ID, photo=file_id,
@@ -584,8 +836,8 @@ async def screenshot_handler(update, context):
             f"{'━'*20}"
         )
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("「✅ APPROVE」", callback_data=f"approve_deposit_{dep_id}"),
-            InlineKeyboardButton("「❌ REJECT」",  callback_data=f"reject_deposit_{dep_id}"),
+            InlineKeyboardButton("「✅ ᴀᴘᴘʀᴏᴠᴇ」", callback_data=f"approve_deposit_{dep_id}"),
+            InlineKeyboardButton("「❌ ʀᴇᴊᴇᴄᴛ」",  callback_data=f"reject_deposit_{dep_id}"),
         ]])
         try:
             await context.bot.send_photo(chat_id=ADMIN_GROUP_ID, photo=file_id,
@@ -597,6 +849,55 @@ async def screenshot_handler(update, context):
             f"{b('Your deposit is under review.')}\n"
             f"{bi('Funds will be credited once approved.')}",
             parse_mode="HTML", reply_markup=main_menu_kb())
+        return
+
+    # Admin import backup (expects a document with JSON)
+    if context.user_data.get("awaiting_import_backup") and user and is_admin(user.id):
+        # We accept as a document or plain text JSON (fallback)
+        context.user_data.pop("awaiting_import_backup", None)
+        try:
+            if update.message.document:
+                f = await update.message.document.get_file()
+                raw = (await f.download_as_bytearray()).decode("utf-8", errors="ignore")
+            else:
+                raw = update.message.text or ""
+            payload = json.loads(raw)
+            # Upsert settings
+            for s in payload.get("settings") or []:
+                key = str(s.get("key") or "").strip()
+                val = str(s.get("value") or "")
+                if key:
+                    await set_setting(key, val)
+            # Upsert channels
+            for ch in payload.get("force_channels") or []:
+                ch_id = str(ch.get("channel_id") or "").strip()
+                if not ch_id:
+                    continue
+                await col_channels.update_one(
+                    {"channel_id": ch_id},
+                    {"$set": {"channel_id": ch_id, "channel_link": ch.get("channel_link", ""), "channel_name": ch.get("channel_name", ch_id)}},
+                    upsert=True,
+                )
+            # Upsert products by name (simple + safe)
+            for p in payload.get("products") or []:
+                name = str(p.get("name") or "").strip()
+                if not name:
+                    continue
+                doc = {
+                    "name": name,
+                    "price_inr": float(p.get("price_inr") or 0),
+                    "file_msg_ids": [int(x) for x in (p.get("file_msg_ids") or []) if str(x).isdigit()],
+                    "file_msg_id": int(p.get("file_msg_id")) if str(p.get("file_msg_id") or "").isdigit() else None,
+                    "file_channel_id": int(p.get("file_channel_id")) if str(p.get("file_channel_id") or "").lstrip("-").isdigit() else FILE_CHANNEL_ID,
+                    "enabled": bool(p.get("enabled", True)),
+                    "created_at": now_ist(),
+                }
+                await col_products.update_one({"name": name}, {"$set": doc}, upsert=True)
+
+            await update.message.reply_text(f"✅ {b('Backup imported successfully!')}", parse_mode="HTML", reply_markup=admin_tools_kb())
+        except Exception as e:
+            logger.error(f"Import backup failed: {e}")
+            await update.message.reply_text(f"❌ {b('Import failed. Invalid JSON or file.')}", parse_mode="HTML", reply_markup=admin_tools_kb())
         return
 
 # ─── APPROVE / REJECT ORDER ───────────────────────────────────────────────────
@@ -731,9 +1032,9 @@ async def wallet(update, context):
         f"{'━'*20}\n{bi('Deposit funds to buy products.')}"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("「➕ DEPOSIT VIA UPI」", callback_data="deposit_upi")],
-        [InlineKeyboardButton("「📋 DEPOSIT HISTORY」", callback_data="dep_hist_0")],
-        [InlineKeyboardButton("「🔙 MAIN MENU」",       callback_data="main_menu")],
+        [InlineKeyboardButton("「➕ ᴅᴇᴘᴏsɪᴛ ᴠɪᴀ ᴜᴘɪ」", callback_data="deposit_upi")],
+        [InlineKeyboardButton("「📋 ᴅᴇᴘᴏsɪᴛ ʜɪsᴛᴏʀʏ」", callback_data="dep_hist_0")],
+        [InlineKeyboardButton("「🔙 ᴍᴀɪɴ ᴍᴇɴᴜ」",       callback_data="main_menu")],
     ])
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
     await query.message.delete()
@@ -748,7 +1049,7 @@ async def deposit_upi_cb(update, context):
         f"{b('Enter the amount you want to deposit in INR:')}\n"
         f"{bi('Minimum: ₹20')}",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「❌ CANCEL」", callback_data="wallet")]]))
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「❌ ᴄᴀɴᴄᴇʟ」", callback_data="wallet")]]))
     await query.message.delete()
 
 # ─── MY ORDERS ────────────────────────────────────────────────────────────────
@@ -763,8 +1064,8 @@ async def my_orders(update, context):
         await query.message.reply_text(
             f"📦 {b('No Orders Yet')}\n{bi('Browse products and make your first purchase!')}",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🛒 BROWSE」", callback_data="browse_0"),
-                                                InlineKeyboardButton("「🔙 MENU」",   callback_data="main_menu")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🛒 ʙʀᴏᴡsᴇ」", callback_data="browse_0"),
+                                                InlineKeyboardButton("「🔙 ᴍᴇɴᴜ」",   callback_data="main_menu")]]))
         await query.message.delete()
         return
     per_page = 5; total = len(orders)
@@ -782,7 +1083,7 @@ async def my_orders(update, context):
     nav.append(InlineKeyboardButton(f"{page+1}/{pages}", callback_data="noop"))
     if page < pages-1: nav.append(InlineKeyboardButton("▶️", callback_data=f"my_orders_{page+1}"))
     if nav: buttons.append(nav)
-    buttons.append([InlineKeyboardButton("「🔙 MENU」", callback_data="main_menu")])
+    buttons.append([InlineKeyboardButton("「🔙 ᴍᴇɴᴜ」", callback_data="main_menu")])
     await query.message.reply_text(
         f"�� {b('My Orders')}\n{'━'*20}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
@@ -806,7 +1107,7 @@ async def order_detail(update, context):
         f"📊 {status_emoji(o['status'])} {b(o['status'].title())}\n"
         f"�� {fmt_time(o['created_at'])}\n{'━'*20}"
     )
-    buttons = [[InlineKeyboardButton("「🔙 MY ORDERS」", callback_data="my_orders_0")]]
+    buttons = [[InlineKeyboardButton("「🔙 ᴍʏ ᴏʀᴅᴇʀs」", callback_data="my_orders_0")]]
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
     await query.message.delete()
 
@@ -820,7 +1121,7 @@ async def dep_hist(update, context):
     if not deps:
         await query.message.reply_text(
             f"📋 {b('No Deposits Yet')}", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🔙 WALLET」", callback_data="wallet")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🔙 ᴡᴀʟʟᴇᴛ」", callback_data="wallet")]]))
         await query.message.delete()
         return
     per_page = 5; total = len(deps)
@@ -834,7 +1135,7 @@ async def dep_hist(update, context):
     if page > 0: nav.append(InlineKeyboardButton("◀️", callback_data=f"dep_hist_{page-1}"))
     if page < pages-1: nav.append(InlineKeyboardButton("▶️", callback_data=f"dep_hist_{page+1}"))
     buttons = [nav] if nav else []
-    buttons.append([InlineKeyboardButton("「🔙 WALLET」", callback_data="wallet")])
+    buttons.append([InlineKeyboardButton("「🔙 ᴡᴀʟʟᴇᴛ」", callback_data="wallet")])
     await query.message.reply_text("\n".join(lines), parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(buttons))
     await query.message.delete()
@@ -853,8 +1154,8 @@ async def help_cb(update, context):
         f"💬 {b('Need help? Contact')} <a href='{SUPPORT_LINK}'>{b('Support')}</a>"
     )
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("「💬 CONTACT SUPPORT」", url=SUPPORT_LINK)],
-        [InlineKeyboardButton("「🔙 MAIN MENU」",       callback_data="main_menu")],
+        [InlineKeyboardButton("「💬 ᴄᴏɴᴛᴀᴄᴛ sᴜᴘᴘᴏʀᴛ」", url=SUPPORT_LINK)],
+        [InlineKeyboardButton("「🔙 ᴍᴀɪɴ ᴍᴇɴᴜ」",       callback_data="main_menu")],
     ])
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
     await query.message.delete()
@@ -899,7 +1200,7 @@ async def text_handler(update, context):
         await update.message.reply_text(
             f"📸 {b('Send your payment screenshot now:')}",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「❌ CANCEL」", callback_data="wallet")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「❌ ᴄᴀɴᴄᴇʟ」", callback_data="wallet")]]))
         return
 
     if context.user_data.get("awaiting_product_name"):
@@ -937,11 +1238,15 @@ async def text_handler(update, context):
         file_ids = [int(x) for x in parts] if parts else []
         name  = context.user_data.pop("new_product_name", "Product")
         price = context.user_data.pop("new_product_price", 0)
+        # Optional: category assignment
+        cat_id = context.user_data.pop("new_product_category_id", "")
         product = {"name": name, "price_inr": price,
                    "file_msg_ids": file_ids,
                    "file_msg_id": file_ids[0] if file_ids else None,
                    "file_channel_id": FILE_CHANNEL_ID,
                    "enabled": True, "created_at": now_ist()}
+        if cat_id:
+            product["category_id"] = cat_id
         result = await col_products.insert_one(product)
         ids_display = " | ".join(str(x) for x in file_ids) if file_ids else sc("Not set")
         await update.message.reply_text(
@@ -950,7 +1255,31 @@ async def text_handler(update, context):
             f"📁 {b(str(len(file_ids)) + ' File(s):')} {sc(ids_display)}\n"
             f"🆔 <code>{str(result.inserted_id)[:8]}</code>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🔙 ADMIN」", callback_data="admin_menu")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🔙 ᴀᴅᴍɪɴ」", callback_data="admin_menu")]]))
+        return
+
+    if context.user_data.get("awaiting_new_category_name") and user and is_admin(user.id):
+        context.user_data.pop("awaiting_new_category_name", None)
+        name = (update.message.text or "").strip()
+        if not name:
+            await update.message.reply_text(f"❌ {b('Name required.')}", parse_mode="HTML")
+            return
+        await col_categories.update_one({"name": name}, {"$set": {"name": name, "enabled": True, "created_at": now_ist()}}, upsert=True)
+        await update.message.reply_text(f"✅ {b('Category added!')}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[cbutton("🔙 "+sc("Back"), callback_data="admin_cats", style="primary")]]))
+        return
+
+    if context.user_data.get("awaiting_rename_category_id") and user and is_admin(user.id):
+        cid = context.user_data.pop("awaiting_rename_category_id", "")
+        name = (update.message.text or "").strip()
+        if not name:
+            await update.message.reply_text(f"❌ {b('Name required.')}", parse_mode="HTML")
+            return
+        try:
+            from bson import ObjectId
+            await col_categories.update_one({"_id": ObjectId(cid)}, {"$set": {"name": name}})
+        except Exception:
+            pass
+        await update.message.reply_text(f"✅ {b('Renamed!')}", parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[cbutton("🔙 "+sc("Back"), callback_data="admin_cats", style="primary")]]))
         return
 
     if context.user_data.get("admin_edit_balance_uid"):
@@ -966,7 +1295,7 @@ async def text_handler(update, context):
         await update.message.reply_text(
             f"✅ {b('Balance Updated')}\n{b(sign + str(delta) + ' INR')}\n{b('New Balance:')} {b('₹' + f'{bal:.2f}')}",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🔙 ADMIN」", callback_data="admin_menu")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🔙 ᴀᴅᴍɪɴ」", callback_data="admin_menu")]]))
         return
 
     if context.user_data.get("awaiting_search_user"):
@@ -985,7 +1314,31 @@ async def text_handler(update, context):
         await update.message.reply_text(
             f"✅ {b('Welcome message updated!')}",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🔙 ADMIN」", callback_data="admin_menu")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🔙 ᴀᴅᴍɪɴ」", callback_data="admin_menu")]]))
+        return
+
+    if context.user_data.get("awaiting_setting_key") and user and is_admin(user.id):
+        key = context.user_data.pop("awaiting_setting_key", "")
+        val = (update.message.text or "").strip()
+        if key == "start_image_url" and val.upper() == "OFF":
+            val = ""
+        if key == "auto_broadcast_interval_min":
+            if not val.isdigit():
+                await update.message.reply_text(f"❌ {b('Send a number in minutes (example: 60).')}", parse_mode="HTML")
+                context.user_data["awaiting_setting_key"] = key
+                return
+            minutes = max(10, int(val))
+            val = str(minutes)
+        if key in ("support_link", "owner_link") and val and not (val.startswith("http://") or val.startswith("https://")):
+            await update.message.reply_text(f"❌ {b('Please send a valid link starting with https://')}", parse_mode="HTML")
+            context.user_data["awaiting_setting_key"] = key
+            return
+        await set_setting(key, val)
+        await update.message.reply_text(
+            f"✅ {b('Updated!')}\n{'━'*20}\n<b>{escape(key)}</b> = <code>{escape(val) if val else 'OFF'}</code>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 "+sc("Settings"), callback_data="admin_settings")]]),
+        )
         return
 
     if context.user_data.get("awaiting_broadcast"):
@@ -994,8 +1347,8 @@ async def text_handler(update, context):
         context.user_data["broadcast_msg_id"]  = update.message.message_id
         context.user_data["broadcast_chat_id"] = update.message.chat_id
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"✅ " + sc(f"Send to {len(users)} users"), callback_data="broadcast_confirm"),
-            InlineKeyboardButton("「❌ CANCEL」", callback_data="admin_menu"),
+            ibutton_raw(f"✅ " + sc(f"Send to {len(users)} users"), callback_data="broadcast_confirm", style="success"),
+            ibutton_raw("「❌ ᴄᴀɴᴄᴇʟ」", callback_data="admin_menu", style="danger"),
         ]])
         await update.message.reply_text(
             f"📢 {b(f'Send to {len(users)} users?')}", parse_mode="HTML", reply_markup=kb)
@@ -1013,7 +1366,7 @@ async def text_handler(update, context):
             {"$set": {"channel_id": ch_id, "channel_link": ch_link, "channel_name": ch_name}}, upsert=True)
         await update.message.reply_text(
             f"✅ {b('Channel added:')} {b(ch_name)}", parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🔙 ADMIN」", callback_data="admin_menu")]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("「🔙 ᴀᴅᴍɪɴ」", callback_data="admin_menu")]]))
         return
 # ADMIN PANEL
 async def admin_cmd(update, context):
@@ -1024,15 +1377,17 @@ async def admin_cmd(update, context):
 
 def admin_main_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton('📦 '+sc('Products'),  callback_data='admin_products'),
-         InlineKeyboardButton('💰 '+sc('Orders'),    callback_data='admin_orders_all_0'),
-         InlineKeyboardButton('💳 '+sc('Deposits'),  callback_data='admin_deps_all_0')],
-        [InlineKeyboardButton('👥 '+sc('Users'),     callback_data='admin_users'),
-         InlineKeyboardButton('📊 '+sc('Stats'),     callback_data='admin_stats'),
-         InlineKeyboardButton('📢 '+sc('Broadcast'), callback_data='admin_broadcast')],
-        [InlineKeyboardButton('📡 '+sc('Channels'),  callback_data='admin_channels'),
-         InlineKeyboardButton('⚙️ '+sc('Settings'),  callback_data='admin_settings'),
-         InlineKeyboardButton('❌ '+sc('Close'),      callback_data='admin_close')],
+        [ibutton_raw('📦 '+sc('Products'),  callback_data='admin_products', style='primary'),
+         ibutton_raw('💰 '+sc('Orders'),    callback_data='admin_orders_all_0', style='primary'),
+         ibutton_raw('💳 '+sc('Deposits'),  callback_data='admin_deps_all_0', style='success')],
+        [ibutton_raw('👥 '+sc('Users'),     callback_data='admin_users', style='primary'),
+         ibutton_raw('📊 '+sc('Stats'),     callback_data='admin_stats', style='primary'),
+         ibutton_raw('📢 '+sc('Broadcast'), callback_data='admin_broadcast', style='success')],
+        [ibutton_raw('🧰 '+sc('Tools'),     callback_data='admin_tools', style='success')],
+        [ibutton_raw('📂 '+sc('Categories'), callback_data='admin_cats', style='primary')],
+        [ibutton_raw('📡 '+sc('Channels'),  callback_data='admin_channels', style='primary'),
+         ibutton_raw('⚙️ '+sc('Settings'),  callback_data='admin_settings', style='primary'),
+         ibutton_raw('❌ '+sc('Close'),      callback_data='admin_close', style='danger')],
     ])
 
 async def admin_menu_cb(update, context):
@@ -1066,6 +1421,11 @@ async def add_product(update, context):
     await query.answer()
     if not is_admin(query.from_user.id): return
     context.user_data['awaiting_product_name'] = True
+    # Allow category selection during add flow (optional)
+    cats = [c async for c in col_categories.find({"enabled": {"$ne": False}}).sort("name", 1)]
+    if cats:
+        context.user_data["awaiting_product_category"] = True
+        # We'll ask for category after name, unless admin chooses now
     await query.message.reply_text(f'📦 {b(chr(69)+chr(110)+chr(116)+chr(101)+chr(114)+chr(32)+chr(112)+chr(114)+chr(111)+chr(100)+chr(117)+chr(99)+chr(116)+chr(32)+chr(110)+chr(97)+chr(109)+chr(101)+chr(58))}', parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('❌ '+sc('Cancel'), callback_data='admin_products')]]))
     await query.message.delete()
 
@@ -1164,8 +1524,8 @@ async def admin_order_view(update, context):
             f"📊 {status_emoji(o['status'])} {b(o['status'].title())}\n📅 {fmt_time(o['created_at'])}")
     buttons = []
     if o["status"] == "pending":
-        buttons.append([InlineKeyboardButton("「✅ APPROVE」", callback_data=f"approve_order_{oid}"),
-                        InlineKeyboardButton("「❌ REJECT」",  callback_data=f"reject_order_{oid}")])
+        buttons.append([InlineKeyboardButton("「✅ ᴀᴘᴘʀᴏᴠᴇ」", callback_data=f"approve_order_{oid}"),
+                        InlineKeyboardButton("「❌ ʀᴇᴊᴇᴄᴛ」",  callback_data=f"reject_order_{oid}")])
     buttons.append([InlineKeyboardButton("🔙 "+sc("Orders"), callback_data="admin_orders_all_0")])
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
     await query.message.delete()
@@ -1213,8 +1573,8 @@ async def admin_dep_view(update, context):
             f"📊 {status_emoji(d['status'])} {b(d['status'].title())}\n📅 {fmt_time(d['created_at'])}")
     buttons = []
     if d["status"] == "pending":
-        buttons.append([InlineKeyboardButton("「✅ APPROVE」", callback_data=f"approve_deposit_{did}"),
-                        InlineKeyboardButton("「❌ REJECT」",  callback_data=f"reject_deposit_{did}")])
+        buttons.append([InlineKeyboardButton("「✅ ᴀᴘᴘʀᴏᴠᴇ」", callback_data=f"approve_deposit_{did}"),
+                        InlineKeyboardButton("「❌ ʀᴇᴊᴇᴄᴛ」",  callback_data=f"reject_deposit_{did}")])
     buttons.append([InlineKeyboardButton("🔙 "+sc("Deposits"), callback_data="admin_deps_all_0")])
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
     await query.message.delete()
@@ -1325,11 +1685,134 @@ async def admin_channels(update, context):
     buttons = []
     for ch in channels:
         lines.append(f"• {b(ch.get('channel_name','?'))} | {sc(ch['channel_id'])}")
-        buttons.append([InlineKeyboardButton(f"🗑️ "+sc("Remove "+ch.get('channel_name','?')), callback_data=f"del_channel_{ch['channel_id']}")])
+        buttons.append([cbutton(f"🗑️ "+sc("Remove "+ch.get('channel_name','?')), callback_data=f"del_channel_{ch['channel_id']}", style="danger")])
     if not channels: lines.append(bi("No channels added yet."))
-    buttons.append([InlineKeyboardButton("➕ "+sc("Add Channel"), callback_data="add_channel")])
-    buttons.append([InlineKeyboardButton("🔙 "+sc("Back"),        callback_data="admin_menu")])
+    buttons.append([cbutton("➕ "+sc("Add Channel"), callback_data="add_channel", style="success")])
+    buttons.append([cbutton("🔙 "+sc("Back"),        callback_data="admin_menu", style="primary")])
     await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+    await query.message.delete()
+
+
+async def admin_cats(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    cats = [c async for c in col_categories.find({}).sort("name", 1)]
+    lines = [f"📂 {b('Categories')}\n{'━'*20}"]
+    buttons = []
+    for c in cats:
+        cid = str(c["_id"])
+        name = c.get("name", "Category")
+        enabled = c.get("enabled", True) is not False
+        lines.append(f"• {'✅' if enabled else '❌'} {b(name)}")
+        buttons.append([
+            cbutton(("✅ " if enabled else "❌ ") + sc(name), callback_data=f"admin_cat_{cid}"),
+        ])
+    if not cats:
+        lines.append(bi("No categories yet. Add one now."))
+    buttons.append([cbutton("➕ "+sc("Add Category"), callback_data="admin_cat_add", style="success")])
+    buttons.append([cbutton("🔙 "+sc("Back"), callback_data="admin_menu", style="primary")])
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
+    await query.message.delete()
+
+
+async def admin_cat_detail(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    from bson import ObjectId
+    cid = query.data.split("_", 2)[2]
+    try:
+        c = await col_categories.find_one({"_id": ObjectId(cid)})
+    except Exception:
+        c = None
+    if not c:
+        await query.answer(sc("Not found."), show_alert=True)
+        return
+    enabled = c.get("enabled", True) is not False
+    name = c.get("name", "Category")
+    text = (
+        f"📂 {b('Category')}\n{'━'*20}\n"
+        f"🏷️ {b('Name:')} {b(name)}\n"
+        f"🔘 {b('Status:')} {b('Enabled' if enabled else 'Disabled')}\n"
+        f"{'━'*20}"
+    )
+    kb = InlineKeyboardMarkup([
+        [cbutton("🔛 "+sc("Toggle"), callback_data=f"admin_cat_toggle_{cid}", style="primary"),
+         cbutton("✏️ "+sc("Rename"), callback_data=f"admin_cat_rename_{cid}", style="success")],
+        [cbutton("🗑️ "+sc("Delete"), callback_data=f"admin_cat_del_{cid}", style="danger")],
+        [cbutton("🔙 "+sc("Back"), callback_data="admin_cats", style="primary")],
+    ])
+    await query.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+    await query.message.delete()
+
+
+async def admin_cat_add(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    context.user_data["awaiting_new_category_name"] = True
+    await query.message.reply_text(
+        f"➕ {b('Add Category')}\n{'━'*20}\n{bi('Send category name:')}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[cbutton("❌ "+sc("Cancel"), callback_data="admin_cats", style="danger")]]),
+    )
+    await query.message.delete()
+
+
+async def admin_cat_toggle(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    from bson import ObjectId
+    cid = query.data.split("_", 3)[3]
+    try:
+        c = await col_categories.find_one({"_id": ObjectId(cid)})
+    except Exception:
+        c = None
+    if not c:
+        return
+    new_val = not (c.get("enabled", True) is not False)
+    await col_categories.update_one({"_id": c["_id"]}, {"$set": {"enabled": new_val}})
+    await query.answer(sc("Enabled") if new_val else sc("Disabled"), show_alert=True)
+    query.data = f"admin_cat_{cid}"
+    await admin_cat_detail(update, context)
+
+
+async def admin_cat_del(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    from bson import ObjectId
+    cid = query.data.split("_", 3)[3]
+    try:
+        await col_categories.delete_one({"_id": ObjectId(cid)})
+        # Also unlink products from this category
+        await col_products.update_many({"category_id": cid}, {"$unset": {"category_id": ""}})
+    except Exception:
+        pass
+    await query.answer(sc("Deleted!"), show_alert=True)
+    query.data = "admin_cats"
+    await admin_cats(update, context)
+
+
+async def admin_cat_rename(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    cid = query.data.split("_", 3)[3]
+    context.user_data["awaiting_rename_category_id"] = cid
+    await query.message.reply_text(
+        f"✏️ {b('Rename Category')}\n{'━'*20}\n{bi('Send new category name:')}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[cbutton("❌ "+sc("Cancel"), callback_data="admin_cats", style="danger")]]),
+    )
     await query.message.delete()
 
 async def add_channel(update, context):
@@ -1341,7 +1824,7 @@ async def add_channel(update, context):
         f"{b('Send in this format:')}\n<code>channel_id invite_link Channel Name</code>\n\n"
         f"{bi('Example:')}\n<code>-1001234567890 https://t.me/mychannel My Channel</code>",
         parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ "+sc("Cancel"), callback_data="admin_channels")]]))
+        reply_markup=InlineKeyboardMarkup([[cbutton("❌ "+sc("Cancel"), callback_data="admin_channels", style="danger")]]))
     await query.message.delete()
 
 async def del_channel_cb(update, context):
@@ -1357,13 +1840,71 @@ async def admin_settings(update, context):
     query = update.callback_query; await query.answer()
     if not is_admin(query.from_user.id): return
     maint = await get_setting("maintenance", "0") == "1"
+    ab_on = await get_setting("auto_broadcast_enabled", "0") == "1"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔧 "+sc("Maintenance: ON→OFF" if maint else "Maintenance: OFF→ON"), callback_data="toggle_maintenance")],
+        [InlineKeyboardButton("📣 "+sc("Auto Broadcast: ON→OFF" if ab_on else "Auto Broadcast: OFF→ON"), callback_data="toggle_auto_broadcast")],
+        [InlineKeyboardButton("🕒 "+sc("Set Auto Interval"), callback_data="set_auto_broadcast_interval")],
+        [InlineKeyboardButton("📝 "+sc("Set Auto Message"), callback_data="set_auto_broadcast_message")],
+        [InlineKeyboardButton("🏦 "+sc("UPI ID"),          callback_data="set_upi_id")],
+        [InlineKeyboardButton("💬 "+sc("Support Link"),    callback_data="set_support_link")],
+        [InlineKeyboardButton("👑 "+sc("Owner Link"),      callback_data="set_owner_link")],
+        [InlineKeyboardButton("🖼️ "+sc("Start Image"),     callback_data="set_start_image_url")],
         [InlineKeyboardButton("📝 "+sc("Welcome Message"), callback_data="edit_welcome_msg")],
         [InlineKeyboardButton("🔙 "+sc("Back"),            callback_data="admin_menu")],
     ])
     await query.message.reply_text(f"⚙️ {b('Settings')}", parse_mode="HTML", reply_markup=kb)
     await query.message.delete()
+
+
+async def _ask_setting_text(update, context, key: str, title_html: str, hint_html: str):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    context.user_data["awaiting_setting_key"] = key
+    await query.message.reply_text(
+        f"{title_html}\n{'━'*20}\n{hint_html}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ "+sc("Cancel"), callback_data="admin_settings")]]),
+    )
+    await query.message.delete()
+
+
+async def set_upi_id_cb(update, context):
+    await _ask_setting_text(
+        update, context,
+        "upi_id",
+        f"🏦 {b('Set UPI ID')}",
+        bi("Send the new UPI ID. Example: name@bank"),
+    )
+
+
+async def set_support_link_cb(update, context):
+    await _ask_setting_text(
+        update, context,
+        "support_link",
+        f"💬 {b('Set Support Link')}",
+        bi("Send Telegram support link. Example: https://t.me/youruser"),
+    )
+
+
+async def set_owner_link_cb(update, context):
+    await _ask_setting_text(
+        update, context,
+        "owner_link",
+        f"👑 {b('Set Owner Link')}",
+        bi("Send Telegram owner link. Example: https://t.me/youruser"),
+    )
+
+
+async def set_start_image_url_cb(update, context):
+    await _ask_setting_text(
+        update, context,
+        "start_image_url",
+        f"🖼️ {b('Set Start Image URL')}",
+        bi("Send direct image URL (https://...) or type OFF to disable start image."),
+    )
 
 async def toggle_maintenance(update, context):
     query = update.callback_query; await query.answer()
@@ -1371,6 +1912,35 @@ async def toggle_maintenance(update, context):
     await set_setting("maintenance", new)
     await query.answer(sc("Maintenance ON" if new=="1" else "Maintenance OFF"), show_alert=True)
     await admin_settings(update, context)
+
+
+async def toggle_auto_broadcast(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    new = "0" if await get_setting("auto_broadcast_enabled", "0") == "1" else "1"
+    await set_setting("auto_broadcast_enabled", new)
+    await query.answer(sc("Auto broadcast ON" if new == "1" else "Auto broadcast OFF"), show_alert=True)
+    await admin_settings(update, context)
+
+
+async def set_auto_broadcast_interval_cb(update, context):
+    await _ask_setting_text(
+        update, context,
+        "auto_broadcast_interval_min",
+        f"🕒 {b('Set Auto Broadcast Interval')}",
+        bi("Send minutes. Example: 60 (for every 1 hour). Minimum 10."),
+    )
+
+
+async def set_auto_broadcast_message_cb(update, context):
+    await _ask_setting_text(
+        update, context,
+        "auto_broadcast_message",
+        f"📝 {b('Set Auto Broadcast Message')}",
+        bi("Send the message text that bot will broadcast automatically."),
+    )
 
 async def edit_welcome_msg(update, context):
     query = update.callback_query; await query.answer()
@@ -1404,6 +1974,118 @@ async def broadcast_confirm(update, context):
     await query.message.reply_text(f"✅ {b(f'Broadcast sent to {success}/{len(users)} users.')}", parse_mode="HTML")
     await query.message.delete()
 
+
+async def _auto_broadcast_job(context: ContextTypes.DEFAULT_TYPE):
+    """Periodic job: broadcast configured message to all users."""
+    try:
+        enabled = await get_setting("auto_broadcast_enabled", "0") == "1"
+        if not enabled:
+            return
+        msg = await get_setting("auto_broadcast_message", "")
+        if not msg.strip():
+            return
+        users_cursor = col_users.find({"is_banned": {"$ne": True}}, {"_id": 1})
+        sent = 0
+        async for u in users_cursor:
+            try:
+                await context.bot.send_message(chat_id=u["_id"], text=apply_custom_emoji_html(msg), parse_mode="HTML")
+                sent += 1
+                if sent % 25 == 0:
+                    await asyncio.sleep(0.8)
+            except Exception:
+                continue
+        # Optional: log summary
+        try:
+            await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=f"📣 {b('Auto broadcast sent:')} {b(str(sent))}", parse_mode="HTML")
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"auto broadcast job error: {e}")
+
+
+async def admin_tools(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    await query.message.reply_text(f"🧰 {b('Admin Tools')}", parse_mode="HTML", reply_markup=admin_tools_kb())
+    await query.message.delete()
+
+
+def _safe_jsonable(doc: dict) -> dict:
+    out = {}
+    for k, v in (doc or {}).items():
+        if k == "_id":
+            out[k] = str(v)
+        elif isinstance(v, (datetime,)):
+            out[k] = v.isoformat()
+        elif isinstance(v, (list, tuple)):
+            out[k] = [str(x) if hasattr(x, "binary") or str(type(x)).endswith("ObjectId'>") else x for x in v]
+        else:
+            out[k] = v
+    return out
+
+
+async def admin_export(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+
+    # Keep export small + useful: settings, channels, products
+    settings = [s async for s in col_settings.find({})]
+    channels = [c async for c in col_channels.find({})]
+    products = [p async for p in col_products.find({})]
+
+    payload = {
+        "exported_at": now_ist().isoformat(),
+        "settings": [_safe_jsonable(s) for s in settings],
+        "force_channels": [_safe_jsonable(c) for c in channels],
+        "products": [_safe_jsonable(p) for p in products],
+    }
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    buf = io.BytesIO(raw)
+    buf.name = f"store_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    buf.seek(0)
+    await query.message.reply_document(document=buf, caption=sc("Backup exported."), reply_markup=admin_tools_kb())
+    await query.message.delete()
+
+
+async def admin_import(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    context.user_data["awaiting_import_backup"] = True
+    await query.message.reply_text(
+        f"📥 {b('Import Backup')}\n{'━'*20}\n"
+        f"{bi('Send the exported .json file now.')}\n\n"
+        f"⚠️ {b('Note:')} {b('This will upsert settings/channels/products by keys.')}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ "+sc("Cancel"), callback_data="admin_tools")]]),
+    )
+    await query.message.delete()
+
+
+async def admin_cleanup(update, context):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    # Cleanup: mark very old pending orders/deposits as rejected (30 days)
+    cutoff = now_ist() - timedelta(days=30)
+    o = await col_orders.update_many({"status": "pending", "created_at": {"$lt": cutoff}}, {"$set": {"status": "rejected", "reviewed_at": now_ist(), "reviewed_by": query.from_user.id}})
+    d = await col_deposits.update_many({"status": "pending", "created_at": {"$lt": cutoff}}, {"$set": {"status": "rejected", "reviewed_at": now_ist(), "reviewed_by": query.from_user.id}})
+    await query.answer(sc("Cleanup done."), show_alert=True)
+    await query.message.reply_text(
+        f"🧹 {b('Cleanup Complete')}\n{'━'*20}\n"
+        f"📦 {b('Orders updated:')} {b(str(o.modified_count))}\n"
+        f"💳 {b('Deposits updated:')} {b(str(d.modified_count))}",
+        parse_mode="HTML",
+        reply_markup=admin_tools_kb(),
+    )
+    await query.message.delete()
+
 async def addchannel_cmd(update, context):
     if not is_admin(update.effective_user.id): return
     args = context.args
@@ -1423,6 +2105,7 @@ async def removechannel_cmd(update, context):
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_error_handler(error_handler)
     app.add_handler(CommandHandler("start",         start))
     app.add_handler(CommandHandler("admin",         admin_cmd))
     app.add_handler(CommandHandler("addchannel",    addchannel_cmd))
@@ -1432,6 +2115,7 @@ def main():
     app.add_handler(CallbackQueryHandler(browse_numbers,        pattern=r"^browse_\d+$"))
     app.add_handler(CallbackQueryHandler(noop_callback,         pattern="^noop$"))
     app.add_handler(CallbackQueryHandler(product_detail,        pattern=r"^product_[a-f0-9]+$"))
+    app.add_handler(CallbackQueryHandler(category_view,         pattern=r"^cat_[a-f0-9]+$"))
     app.add_handler(CallbackQueryHandler(wallet_buy,            pattern=r"^wallet_buy_[a-f0-9]+$"))
     app.add_handler(CallbackQueryHandler(pay_upi,               pattern=r"^pay_upi_[a-f0-9]+$"))
     app.add_handler(CallbackQueryHandler(buy_upload_prompt,     pattern=r"^buy_upload_[a-f0-9]+$"))
@@ -1465,14 +2149,36 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_stats,           pattern="^admin_stats$"))
     app.add_handler(CallbackQueryHandler(admin_channels,        pattern="^admin_channels$"))
     app.add_handler(CallbackQueryHandler(add_channel,           pattern="^add_channel$"))
+    app.add_handler(CallbackQueryHandler(admin_cats,            pattern="^admin_cats$"))
+    app.add_handler(CallbackQueryHandler(admin_cat_add,         pattern="^admin_cat_add$"))
+    app.add_handler(CallbackQueryHandler(admin_cat_detail,      pattern=r"^admin_cat_[a-f0-9]+$"))
+    app.add_handler(CallbackQueryHandler(admin_cat_toggle,      pattern=r"^admin_cat_toggle_[a-f0-9]+$"))
+    app.add_handler(CallbackQueryHandler(admin_cat_del,         pattern=r"^admin_cat_del_[a-f0-9]+$"))
+    app.add_handler(CallbackQueryHandler(admin_cat_rename,      pattern=r"^admin_cat_rename_[a-f0-9]+$"))
     app.add_handler(CallbackQueryHandler(del_channel_cb,        pattern=r"^del_channel_"))
     app.add_handler(CallbackQueryHandler(admin_settings,        pattern="^admin_settings$"))
     app.add_handler(CallbackQueryHandler(toggle_maintenance,    pattern="^toggle_maintenance$"))
+    app.add_handler(CallbackQueryHandler(toggle_auto_broadcast, pattern="^toggle_auto_broadcast$"))
+    app.add_handler(CallbackQueryHandler(set_auto_broadcast_interval_cb, pattern="^set_auto_broadcast_interval$"))
+    app.add_handler(CallbackQueryHandler(set_auto_broadcast_message_cb,  pattern="^set_auto_broadcast_message$"))
+    app.add_handler(CallbackQueryHandler(set_upi_id_cb,         pattern="^set_upi_id$"))
+    app.add_handler(CallbackQueryHandler(set_support_link_cb,   pattern="^set_support_link$"))
+    app.add_handler(CallbackQueryHandler(set_owner_link_cb,     pattern="^set_owner_link$"))
+    app.add_handler(CallbackQueryHandler(set_start_image_url_cb,pattern="^set_start_image_url$"))
     app.add_handler(CallbackQueryHandler(edit_welcome_msg,      pattern="^edit_welcome_msg$"))
     app.add_handler(CallbackQueryHandler(admin_broadcast,       pattern="^admin_broadcast$"))
     app.add_handler(CallbackQueryHandler(broadcast_confirm,     pattern="^broadcast_confirm$"))
+    app.add_handler(CallbackQueryHandler(admin_tools,           pattern="^admin_tools$"))
+    app.add_handler(CallbackQueryHandler(admin_export,          pattern="^admin_export$"))
+    app.add_handler(CallbackQueryHandler(admin_import,          pattern="^admin_import$"))
+    app.add_handler(CallbackQueryHandler(admin_cleanup,         pattern="^admin_cleanup$"))
     app.add_handler(MessageHandler(filters.PHOTO,                   screenshot_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    # Auto broadcast scheduler (reads settings each run)
+    try:
+        app.job_queue.run_repeating(_auto_broadcast_job, interval=60, first=60)
+    except Exception as e:
+        logger.error(f"job queue init failed: {e}")
     logger.info("✅ Store Bot Started!")
     app.run_polling(drop_pending_updates=True)
 
