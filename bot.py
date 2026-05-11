@@ -618,7 +618,7 @@ async def deliver_file(bot, user_id, product, order_id):
         return
 
     delivered = 0
-    delivered_msg_ids: List[int] = []
+    delivered_msg_ids: list[int] = []
     for i, fid in enumerate(raw_ids):
         try:
             # First file gets caption, rest get none — no "Forwarded from" + protect_content
@@ -659,7 +659,7 @@ async def deliver_file(bot, user_id, product, order_id):
             parse_mode="HTML")
 
 
-async def _log_delivery_to_admin(bot, user_id: int, product: dict, order_id: str, file_msg_ids: List[int], file_channel: int):
+async def _log_delivery_to_admin(bot, user_id: int, product: dict, order_id: str, file_msg_ids: list[int], file_channel: int):
     """Send delivery proof to ADMIN_GROUP_ID: info + copied file(s)."""
     try:
         user = await bot.get_chat(user_id)
@@ -721,7 +721,7 @@ async def _log_delivery_to_admin(bot, user_id: int, product: dict, order_id: str
             pass
 
 
-async def _delete_delivered_after(bot, user_id: int, msg_ids: List[int], seconds: int = 3600):
+async def _delete_delivered_after(bot, user_id: int, msg_ids: list[int], seconds: int = 3600):
     """Delete delivered file messages after `seconds` and notify user."""
     if not msg_ids:
         return
